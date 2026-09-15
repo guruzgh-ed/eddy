@@ -2716,10 +2716,23 @@ fi
 chmod 600 "$WGCF_DIR/wgcf-account.toml" "$WGCF_DIR/wgcf-profile.conf"
 
 WARP_PROFILE="$WGCF_DIR/wgcf-profile.conf"
-WARP_PRIVATE_KEY="$(awk -F'[[:space:]]*=[[:space:]]*' '/^[[:space:]]*PrivateKey[[:space:]]*=/{print $2; exit}' "$WARP_PROFILE")"
-WARP_PUBLIC_KEY="$(awk -F'[[:space:]]*=[[:space:]]*' '/^[[:space:]]*PublicKey[[:space:]]*=/{print $2; exit}' "$WARP_PROFILE")"
-WARP_ENDPOINT="$(awk -F'[[:space:]]*=[[:space:]]*' '/^[[:space:]]*Endpoint[[:space:]]*=/{print $2; exit}' "$WARP_PROFILE")"
-mapfile -t WARP_ADDRESSES < <(awk -F'[[:space:]]*=[[:space:]]*' '/^[[:space:]]*Address[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); n=split($2,a,","); for(i=1;i<=n;i++) if(a[i] != "") print a[i]}' "$WARP_PROFILE")
+# Parse only the first key/value delimiter. WireGuard keys are Base64 and
+# normally end in "=", so splitting on every equals sign truncates them.
+WARP_PRIVATE_KEY="$(sed -n 's/^[[:space:]]*PrivateKey[[:space:]]*=[[:space:]]*//p' "$WARP_PROFILE" | head -n1 | tr -d '\r')"
+WARP_PUBLIC_KEY="$(sed -n 's/^[[:space:]]*PublicKey[[:space:]]*=[[:space:]]*//p' "$WARP_PROFILE" | head -n1 | tr -d '\r')"
+WARP_ENDPOINT="$(sed -n 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*//p' "$WARP_PROFILE" | head -n1 | tr -d '\r')"
+WARP_ADDRESS_LINE="$(sed -n 's/^[[:space:]]*Address[[:space:]]*=[[:space:]]*//p' "$WARP_PROFILE" | head -n1 | tr -d '\r')"
+mapfile -t WARP_ADDRESSES < <(printf '%s\n' "$WARP_ADDRESS_LINE" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d')
+
+# WireGuard Curve25519 public/private keys decode to 32 bytes and are
+# represented as 44-character Base64 strings (including padding).
+if ! printf '%s' "$WARP_PRIVATE_KEY" | base64 -d >/dev/null 2>&1 ||
+   ! printf '%s' "$WARP_PUBLIC_KEY" | base64 -d >/dev/null 2>&1 ||
+   [ "$(printf '%s' "$WARP_PRIVATE_KEY" | base64 -d 2>/dev/null | wc -c)" -ne 32 ] ||
+   [ "$(printf '%s' "$WARP_PUBLIC_KEY" | base64 -d 2>/dev/null | wc -c)" -ne 32 ]; then
+  echo "The generated WARP WireGuard keys are invalid."
+  exit 1
+fi
 
 if [ -z "$WARP_PRIVATE_KEY" ] || [ -z "$WARP_PUBLIC_KEY" ] || [ -z "$WARP_ENDPOINT" ] || [ "${#WARP_ADDRESSES[@]}" -eq 0 ]; then
   echo "The generated WARP WireGuard profile is incomplete."
@@ -2926,15 +2939,21 @@ cat > /etc/systemd/system/hysteria-server.service <<EOF
 [Unit]
 Description=Sing-Box Hysteria v1 Core
 After=network.target
+Wants=network.target
+
 [Service]
+Type=simple
 User=root
 ExecStart=/usr/bin/sing-box run -c /etc/hysteria/config.json
 Restart=on-failure
+RestartSec=2
 LimitNOFILE=1048576
+
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload; systemctl enable hysteria-server.service; systemctl start hysteria-server.service
+systemctl daemon-reload
+systemctl enable --now hysteria-server.service
 
 # === HYSTERIA 2 ===
 HYSTERIA2_VER="app/v2.9.3"
