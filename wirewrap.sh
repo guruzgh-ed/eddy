@@ -2556,7 +2556,18 @@ cat <<'logrotate' > /etc/logrotate.d/rsyslog
     endscript; 
 }
 logrotate
-chown root:root /var/log; chmod 755 /var/log; chown syslog:adm /var/log/syslog; chmod 640 /var/log/syslog
+chown root:root /var/log
+chmod 755 /var/log
+if [ -e /var/log/syslog ]; then
+  if id -u syslog >/dev/null 2>&1 && getent group adm >/dev/null 2>&1; then
+    chown syslog:adm /var/log/syslog
+  elif getent group adm >/dev/null 2>&1; then
+    chown root:adm /var/log/syslog
+  else
+    chown root:root /var/log/syslog
+  fi
+  chmod 640 /var/log/syslog
+fi
 echo "*/5 * * * * root /usr/sbin/logrotate -v -f /etc/logrotate.d/rsyslog >/dev/null 2>&1" > /etc/cron.d/logrotate
 echo "0 3 * * * root sync; echo 3 > /proc/sys/vm/drop_caches" > /etc/cron.d/drop-cache
 
@@ -2583,7 +2594,7 @@ net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_keepalive_intvl = 60
 net.ipv4.tcp_keepalive_probes = 10
 
-# SOCKS / WARP Local Loopback Optimization
+# TCP transport tuning
 net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_mtu_probing = 1
 
@@ -2662,104 +2673,19 @@ WantedBy=multi-user.target
 END
 systemctl daemon-reload; systemctl enable server-sldns; systemctl restart server-sldns
 
-# === HYSTERIA v1 (Sing-box v1.13.13) & CLOUDFLARE WARP ===
-# Server-only WARP integration: do NOT install Cloudflare's desktop client.
-# The current cloudflare-warp Debian package pulls a large GTK/WebKit/media
-# dependency chain that is unnecessary here.  wgcf is used only to register a
-# normal WARP WireGuard identity; sing-box carries the WARP tunnel itself.
-WGCF_VER="2.2.32"
-WGCF_DIR="/etc/warp-singbox"
-mkdir -p "$WGCF_DIR"
-chmod 700 "$WGCF_DIR"
+# === HYSTERIA v1 (Sing-box v1.13.13) - DIRECT OUTBOUND ===
+# Hysteria v1 terminates in sing-box and all client traffic exits directly
+# through the VPS network. Cloudflare WARP/wgcf is intentionally not used.
 
-case "$(uname -m)" in
-  x86_64|amd64) WGCF_ARCH="amd64" ;;
-  i386|i486|i586|i686) WGCF_ARCH="386" ;;
-  aarch64|arm64) WGCF_ARCH="arm64" ;;
-  armv7l|armv7*) WGCF_ARCH="armv7" ;;
-  *) echo "Unsupported wgcf architecture: $(uname -m)"; exit 1 ;;
-esac
+# Clean up artifacts from older WARP-enabled installs when this script is rerun.
+systemctl disable --now guruz-warp-retry.service >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/guruz-warp-retry.service
+rm -f /usr/local/bin/install-hysteria-warp /usr/local/bin/guruz-warp-auto-retry
+rm -f /var/lib/guruz/warp-pending
+rm -rf /etc/warp-singbox
+systemctl daemon-reload
 
-WGCF_ASSET="wgcf_${WGCF_VER}_linux_${WGCF_ARCH}"
-WGCF_BASE="https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VER}"
-WGCF_TMP="$(mktemp -d /tmp/wgcf-install.XXXXXX)" || exit 1
-if ! curl -fL --retry 3 -o "$WGCF_TMP/$WGCF_ASSET" "$WGCF_BASE/$WGCF_ASSET" ||
-   ! curl -fL --retry 3 -o "$WGCF_TMP/checksums.txt" "$WGCF_BASE/checksums.txt"; then
-  echo "Unable to download wgcf ${WGCF_VER}."
-  rm -rf "$WGCF_TMP"
-  exit 1
-fi
-
-WGCF_EXPECTED="$(awk -v a="$WGCF_ASSET" '$2 == a || $2 == "*" a {print tolower($1); exit}' "$WGCF_TMP/checksums.txt")"
-WGCF_ACTUAL="$(sha256sum "$WGCF_TMP/$WGCF_ASSET" | awk '{print tolower($1)}')"
-if [ -z "$WGCF_EXPECTED" ] || [ "$WGCF_ACTUAL" != "$WGCF_EXPECTED" ]; then
-  echo "wgcf SHA-256 verification failed."
-  rm -rf "$WGCF_TMP"
-  exit 1
-fi
-install -m 700 "$WGCF_TMP/$WGCF_ASSET" /usr/local/sbin/wgcf
-rm -rf "$WGCF_TMP"
-# Reuse an existing WARP identity on reruns.  A fresh server registers only
-# when no account/profile exists yet.
-if [ ! -s "$WGCF_DIR/wgcf-account.toml" ]; then
-  (cd "$WGCF_DIR" && /usr/local/sbin/wgcf register --accept-tos) || {
-    echo "Cloudflare WARP registration failed."
-    exit 1
-  }
-fi
-if [ ! -s "$WGCF_DIR/wgcf-profile.conf" ]; then
-  (cd "$WGCF_DIR" && /usr/local/sbin/wgcf generate) || {
-    echo "Cloudflare WARP profile generation failed."
-    exit 1
-  }
-fi
-chmod 600 "$WGCF_DIR/wgcf-account.toml" "$WGCF_DIR/wgcf-profile.conf"
-
-WARP_PROFILE="$WGCF_DIR/wgcf-profile.conf"
-# Parse only the first key/value delimiter. WireGuard keys are Base64 and
-# normally end in "=", so splitting on every equals sign truncates them.
-WARP_PRIVATE_KEY="$(sed -n 's/^[[:space:]]*PrivateKey[[:space:]]*=[[:space:]]*//p' "$WARP_PROFILE" | head -n1 | tr -d '\r')"
-WARP_PUBLIC_KEY="$(sed -n 's/^[[:space:]]*PublicKey[[:space:]]*=[[:space:]]*//p' "$WARP_PROFILE" | head -n1 | tr -d '\r')"
-WARP_ENDPOINT="$(sed -n 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*//p' "$WARP_PROFILE" | head -n1 | tr -d '\r')"
-WARP_ADDRESS_LINE="$(sed -n 's/^[[:space:]]*Address[[:space:]]*=[[:space:]]*//p' "$WARP_PROFILE" | head -n1 | tr -d '\r')"
-mapfile -t WARP_ADDRESSES < <(printf '%s\n' "$WARP_ADDRESS_LINE" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d')
-
-# WireGuard Curve25519 public/private keys decode to 32 bytes and are
-# represented as 44-character Base64 strings (including padding).
-if ! printf '%s' "$WARP_PRIVATE_KEY" | base64 -d >/dev/null 2>&1 ||
-   ! printf '%s' "$WARP_PUBLIC_KEY" | base64 -d >/dev/null 2>&1 ||
-   [ "$(printf '%s' "$WARP_PRIVATE_KEY" | base64 -d 2>/dev/null | wc -c)" -ne 32 ] ||
-   [ "$(printf '%s' "$WARP_PUBLIC_KEY" | base64 -d 2>/dev/null | wc -c)" -ne 32 ]; then
-  echo "The generated WARP WireGuard keys are invalid."
-  exit 1
-fi
-
-if [ -z "$WARP_PRIVATE_KEY" ] || [ -z "$WARP_PUBLIC_KEY" ] || [ -z "$WARP_ENDPOINT" ] || [ "${#WARP_ADDRESSES[@]}" -eq 0 ]; then
-  echo "The generated WARP WireGuard profile is incomplete."
-  exit 1
-fi
-
-# Split Endpoint safely for hostname/IPv4 or [IPv6]:port forms.  Resolve a
-# hostname to a normal VPS-routed IPv4 address now so the WARP endpoint never
-# depends on, or recursively routes through, its own tunnel.
-if [[ "$WARP_ENDPOINT" =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then
-  WARP_PEER_HOST="${BASH_REMATCH[1]}"
-  WARP_PEER_PORT="${BASH_REMATCH[2]}"
-else
-  WARP_PEER_HOST="${WARP_ENDPOINT%:*}"
-  WARP_PEER_PORT="${WARP_ENDPOINT##*:}"
-fi
-if [[ "$WARP_PEER_HOST" =~ ^[A-Za-z0-9.-]+$ ]] && ! [[ "$WARP_PEER_HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  WARP_PEER_IP="$(getent ahostsv4 "$WARP_PEER_HOST" 2>/dev/null | awk '$1 ~ /^[0-9]+\./ {print $1; exit}')"
-else
-  WARP_PEER_IP="$WARP_PEER_HOST"
-fi
-[ -n "$WARP_PEER_IP" ] || WARP_PEER_IP="$WARP_PEER_HOST"
-
-# JSON fragments used below in the sing-box Hysteria v1 configuration.
-WARP_ADDR_JSON="$(printf '%s\n' "${WARP_ADDRESSES[@]}" | jq -R . | jq -s -c .)" || exit 1
-
-# Upgraded to the stable v1.13.13 core
+# Upgraded to the stable v1.13.13 core.
 wget -qO /tmp/sing-box.deb "https://github.com/SagerNet/sing-box/releases/download/v1.13.13/sing-box_1.13.13_linux_amd64.deb"
 dpkg -i /tmp/sing-box.deb
 apt-mark hold sing-box
@@ -2859,66 +2785,18 @@ cat > /etc/hysteria/config.json <<EOF
       "down_mbps": 1000,
       "obfs": "$OBFS",
       "users": [ { "auth_str": "$PASSWORD" } ],
-      "tls": { "enabled": true, "certificate_path": "/etc/hysteria/hysteria.crt", "key_path": "/etc/hysteria/hysteria.key" }
-    }
-  ],
-  "endpoints": [
-    {
-      "type": "wireguard",
-      "tag": "warp-proxy",
-      "system": false,
-      "mtu": 1280,
-      "address": $WARP_ADDR_JSON,
-      "private_key": "$WARP_PRIVATE_KEY",
-      "peers": [
-        {
-          "address": "$WARP_PEER_IP",
-          "port": $WARP_PEER_PORT,
-          "public_key": "$WARP_PUBLIC_KEY",
-          "allowed_ips": ["0.0.0.0/0", "::/0"],
-          "persistent_keepalive_interval": 30
-        }
-      ]
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/etc/hysteria/hysteria.crt",
+        "key_path": "/etc/hysteria/hysteria.key"
+      }
     }
   ],
   "outbounds": [
-    { "type": "direct", "tag": "direct" },
-    { "type": "block", "tag": "block" }
+    { "type": "direct", "tag": "direct" }
   ],
   "route": {
     "rules": [
-      {
-        "inbound": "hy1-inbound",
-        "network": "udp",
-       "domain_suffix": [ 
-          "doubleclick.net", 
-          "googlesyndication.com", "googleadservices.com", "admob.com", 
-          "google-analytics.com", "app-measurement.com", "adservice.google.com", 
-          "g.doubleclick.net", "pagead2.googlesyndication.com", "tpc.googlesyndication.com", 
-          "gvt1.com", "gvt2.com", "gvt3.com", "googleanalytics.com", 
-          "analytics.google.com", "googleadapis.com", "adsense.com" 
-        ],
-        "outbound": "block"
-      },
-      {
-       "inbound": "hy1-inbound",
-        "domain_suffix": [ 
-          "doubleclick.net", 
-          "googlesyndication.com", "googleadservices.com", "admob.com", 
-          "googleapis.com", "google-analytics.com", "app-measurement.com", 
-          "adservice.google.com", "g.doubleclick.net", "google.com", 
-          "pagead2.googlesyndication.com", "tpc.googlesyndication.com", 
-          "gvt1.com", "gvt2.com", "gvt3.com", "gstatic.com", 
-          "googleusercontent.com", "ggpht.com", "play.google.com", 
-          "firebaseio.com", "firebase.googleapis.com", "crashlytics.com", 
-          "fundingchoicesmessages.google.com", "imasdk.googleapis.com", 
-          "googleanalytics.com", "analytics.google.com", "fcm.googleapis.com", 
-          "mtalk.google.com", "googleadapis.com", 
-          "accounts.google.com", "play.googleapis.com", "android.apis.google.com", 
-          "adsense.com", "1e100.net" 
-        ],
-        "outbound": "warp-proxy"
-      },
       { "inbound": "hy1-inbound", "outbound": "direct" }
     ],
     "auto_detect_interface": true
@@ -2927,7 +2805,7 @@ cat > /etc/hysteria/config.json <<EOF
 EOF
 
 if ! /usr/bin/sing-box check -c /etc/hysteria/config.json; then
-  echo "Hysteria v1 / Sing-box WARP configuration validation failed."
+  echo "Hysteria v1 / Sing-box direct configuration validation failed."
   exit 1
 fi
 
