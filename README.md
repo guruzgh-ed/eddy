@@ -3,12 +3,7 @@
 #### Installation
 ```
 bash <(curl -sL https://raw.githubusercontent.com/guruzgh-ed/eddy/master/wirewrap.sh)
-```
-#### Manual Install Cloudflare Wrap if it fails
-```
-install-hysteria-warp
-```
-           
+```           
 ----
   
 ### Os Supported
