@@ -4,7 +4,6 @@
 ```
 bash <(curl -sL https://raw.githubusercontent.com/guruzgh-ed/eddy/master/wirewrap.sh)
 ```           
-----
   
 ### Os Supported
 ```
