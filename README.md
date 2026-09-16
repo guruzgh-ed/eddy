@@ -1,8 +1,8 @@
-# Multi Script - Hy wire-singbox
+# Multi Script - For Guruz FreeNet VPN's
 
 #### Installation
 ```
-bash <(curl -sL https://raw.githubusercontent.com/guruzgh-ed/eddy/master/wirewrap.sh)
+bash <(curl -sL https://raw.githubusercontent.com/guruzgh-ed/eddy/master/gf.sh)
 ```           
   
 ### Os Supported
